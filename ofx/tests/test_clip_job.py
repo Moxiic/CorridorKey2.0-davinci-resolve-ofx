@@ -4,6 +4,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from clip_job import drive, frame_path, valid_frame
@@ -29,6 +30,23 @@ class Node:
 
 
 class ClipJobTests(unittest.TestCase):
+    def test_progress_publication_failure_does_not_abort_render(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d); output = Output(directory); node = Node(output)
+            with patch("clip_job.atomic_json", side_effect=PermissionError("sharing violation")), self.assertLogs(level="WARNING"):
+                self.assertTrue(drive(node, None, directory, 0, 3))
+            self.assertEqual(output.calls, [0, 1, 2, 3])
+            self.assertIn("DONE", node.status[-1])
+
+    def test_cached_clip_throttles_progress_rpc_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d); output = Output(directory); node = Node(output)
+            for f in range(50): output.GetValue(f)
+            output.calls.clear()
+            self.assertTrue(drive(node, None, directory, 0, 49))
+            self.assertEqual(output.calls, [])
+            self.assertLess(len(node.status), 10)
+            self.assertIn("50 / 50", node.status[-1])
     def test_done_only_after_every_valid_frame(self):
         with tempfile.TemporaryDirectory() as d:
             directory = Path(d); output = Output(directory); node = Node(output)

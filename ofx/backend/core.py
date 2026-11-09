@@ -48,11 +48,10 @@ def to_srgb(rgb):
 def compose(fg, alpha, *, output=0, colorspace=0, despill=.5,
             despeckle=0, refiner=1.0, source=None):
     """All physical operations use scene-linear straight RGB; alpha is coverage."""
-    fg = np.asarray(fg, dtype=np.float32).copy()
     alpha = np.clip(alpha, 0, 1).astype(np.float32)
     if alpha.ndim == 2:
         alpha = alpha[..., None]
-    if refiner != 1.0 and output != 4:
+    if refiner != 1.0 and output not in (1, 4):
         if source is None:
             raise ValueError("Source required for refinement mix")
         # v2 has no CNN strength knob. Mix the v2 color reconstruction instead.
@@ -65,11 +64,15 @@ def compose(fg, alpha, *, output=0, colorspace=0, despill=.5,
         keep[0] = False
         keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= despeckle
         alpha = alpha * keep[labels, None]
-    if output != 4:  # Raw foreground is available without despill/mix presentation.
+    if output == 1:
+        result = np.empty((*alpha.shape[:2], 4), dtype="<f4")
+        result[..., :3] = alpha
+        result[..., 3] = 1
+        return result
+    fg = np.asarray(fg, dtype=np.float32).copy()
+    if output != 4 and despill:  # Skip RGB work entirely for matte/raw outputs.
         spill = np.maximum(fg[..., 1] - (fg[..., 0] + fg[..., 2]) * .5, 0) * despill
         fg += np.stack([spill * .5, -spill, spill * .5], axis=-1)
-    if output == 1:
-        return np.concatenate([np.repeat(alpha, 3, axis=-1), np.ones_like(alpha)], axis=-1)
     if output == 3:
         y, x = np.indices(alpha.shape[:2])
         bg = to_linear(np.where(((x // 32 + y // 32) % 2)[..., None], .35, .18))

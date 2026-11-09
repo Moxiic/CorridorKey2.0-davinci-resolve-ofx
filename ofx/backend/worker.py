@@ -22,12 +22,8 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np
 from core import PROTOCOL, cache_key, compose, read_rgba, to_linear, to_srgb
-
-
-def atomic_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value), encoding="utf-8")
-    os.replace(temporary, path)
+from atomic_io import atomic_json, replace_file
+from model_cache import can_retain
 
 
 class Engine:
@@ -36,6 +32,8 @@ class Engine:
         self.model = None
         self.key = None
         self.staged_signature = None
+        self.model_snapshot = None
+        self.model_last_used = 0.0
         self.output_dir = work / "predictions"
 
     def settings(self, path):
@@ -77,24 +75,33 @@ class Engine:
         self.staged_signature = staged
         i = req["index"]
         if self.mock:
-            fg = np.load(self.output_dir / f"fg_{i:06d}.npy")
+            fg = np.load(self.output_dir / f"fg_{i:06d}.npy") if req["output"] != 1 else None
             alpha = np.load(self.output_dir / f"alpha_{i:06d}.npy")
         else:
             import cv2
-            fg = cv2.imread(str(self.output_dir / "source_fg_exr" / f"fg_{i:06d}.exr"), cv2.IMREAD_UNCHANGED)
+            fg = (cv2.imread(str(self.output_dir / "source_fg_exr" / f"fg_{i:06d}.exr"), cv2.IMREAD_UNCHANGED)
+                  if req["output"] != 1 else None)
             alpha = cv2.imread(str(self.output_dir / "source_alpha_exr" / f"alpha_{i:06d}.exr"), cv2.IMREAD_UNCHANGED)
-            if fg is None or alpha is None:
+            if (fg is None and req["output"] != 1) or alpha is None:
                 raise RuntimeError("v2 runtime did not produce the expected frame")
-            fg = fg[..., ::-1].copy()
-            gain, contrast = settings.get("linear_brightness", 1), settings.get("linear_contrast", 1)
-            pivot = settings.get("linear_contrast_pivot", .18)
-            fg = (fg / gain - pivot) / contrast + pivot
-        src = self.source_linear(source_files[i], req)
+            if fg is not None:
+                fg = fg[..., ::-1].copy()
+                gain, contrast = settings.get("linear_brightness", 1), settings.get("linear_contrast", 1)
+                pivot = settings.get("linear_contrast_pivot", .18)
+                fg = (fg / gain - pivot) / contrast + pivot
+        # Default reconstruction uses model RGB. Only the explicit mix operation
+        # needs source RGB; avoid another full-frame read/transfer conversion.
+        src = self.source_linear(source_files[i], req) if req["refiner"] != 1 and req["output"] not in (1, 4) else None
         result = compose(fg, alpha, output=req["output"], colorspace=req["colorspace"],
                          despill=req["despill"], despeckle=req["despeckle"],
                          refiner=req["refiner"], source=src)
         result.tofile(self.work / "output.tmp")
-        os.replace(self.work / "output.tmp", self.work / "output.bin")
+        replace_file(self.work / "output.tmp", self.work / "output.bin")
+
+    def release_idle_model(self, max_idle=30):
+        if self.model is not None and time.monotonic() - self.model_last_used >= max_idle:
+            self.model = None
+            self.model_snapshot = None
 
     def source_linear(self, path, req):
         rgba = read_rgba(path, req["width"], req["height"])
@@ -116,7 +123,8 @@ class Engine:
         import cv2
         import torch
         sys.path.insert(0, str(self.root))
-        from corridorkey.runtime import InferenceConfig, RuntimePaths, load_model, run_inference
+        from corridorkey.runtime import (InferenceConfig, RuntimePaths, load_model,
+                                       run_inference, configure_low_vram_inference)
         from corridorkey.video_io import WriterConfig
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA PyTorch is required. Run ofx/setup.ps1; CPU-only PyTorch cannot key frames.")
@@ -151,16 +159,34 @@ class Engine:
                 raise RuntimeError("Could not write hint")
         if req["mode"] >= 3:
             self.generate_birefnet_hints(req, files, hint_dir)
+        paths = RuntimePaths.from_package(self.root)
+        # Reuse CPU-resident weights across blocks of one bake, but detect asset
+        # replacement and never keep idle model copies on Resolve's GPU.
+        snapshot = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in
+            (paths.weights, paths.foundation_stats, paths.rvm_ckpt, paths.moge_checkpoint,
+             paths.cradio_dir / "model.safetensors"))
+        if self.model_snapshot != snapshot:
+            self.model = None
         if self.model is None:
-            self.model = load_model(RuntimePaths.from_package(self.root), device="cuda")
-        run_inference(self.model, str(source_dir), str(self.output_dir), cfg, WriterConfig(),
-                      initial_hint_path=str(hint_dir / "hint_000000.png") if req["mode"] == 1 else None,
-                      hint_video_path=str(hint_dir) if req["mode"] >= 2 else None)
-        # Release all CUDA models between inference jobs, allowing other Resolve
-        # nodes/instances to share the GPU. Disk predictions survive output tweaks.
-        del self.model
-        self.model = None
-        torch.cuda.empty_cache()
+            self.model = load_model(paths, device="cuda")
+            self.model_snapshot = snapshot
+        # Reset memory knobs between jobs: model reuse must not retain an earlier
+        # low-VRAM profile when the next job uses the normal path.
+        neutral = InferenceConfig(low_vram_enc_frame_chunk=0, low_vram_mlp_chunk_tokens=0,
+            low_vram_swin_window_batch=0, low_vram_full_attn_query_chunk_tokens=0)
+        configure_low_vram_inference(self.model, neutral)
+        try:
+            run_inference(self.model, str(source_dir), str(self.output_dir), cfg, WriterConfig(),
+                          initial_hint_path=str(hint_dir / "hint_000000.png") if req["mode"] == 1 else None,
+                          hint_video_path=str(hint_dir) if req["mode"] >= 2 else None)
+        finally:
+            if req.get("staged_token") and can_retain(self.model):
+                self.model.cpu()
+                self.model_last_used = time.monotonic()
+            else:
+                self.model = None
+                self.model_snapshot = None
+            torch.cuda.empty_cache()
 
     def generate_birefnet_hints(self, req, files, directory):
         """Optional v1 auto-hint choices; downloaded explicitly, local-only at render."""
@@ -220,6 +246,7 @@ def run(work, root, parent_pid, mock=False):
                 break
             request_path = work / "request.json"
             if not request_path.exists():
+                engine.release_idle_model()
                 if time.monotonic() - idle > 3600:
                     break
                 time.sleep(.025)

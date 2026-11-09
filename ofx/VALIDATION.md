@@ -1,5 +1,29 @@
 # Validation — 23 October 2026
 
+## Optimization pass — 8 November 2026
+
+29 regression tests passed. Real CUDA comparison against baseline commit
+`4f9f8b1` used six 192x128 HDR frames per job, Hann 4/2, and all three hint modes
+plus normal/low-VRAM paths. Complete output arrays matched with maximum absolute
+error **0.0** in all five jobs, including warmup.
+
+| Warm job (first process warmup excluded) | Baseline | Optimized |
+|---|---:|---:|
+| No hint / low VRAM | 6.188 s | 1.562 s |
+| First-frame hint / low VRAM | 5.594 s | 1.579 s |
+| Full hints / low VRAM | 5.843 s | 1.610 s |
+| Full hints / normal, carry off | 5.360 s | 1.687 s |
+
+Warm jobs totaled 22.985 s before and 6.438 s after: **3.57x faster** for this
+small-block overhead benchmark. First-job times were 12.343 s and 12.265 s;
+initial loading still costs time. These are not full-HD/4K frame rates and do
+not establish a playback speed or a full-clip speedup inside Resolve.
+
+The final CPU-retention RAM guard was exercised in the optimized run. The idle
+policy and transient/permanent Windows-lock behavior have regression tests.
+Full Resolve UI processing was not re-run during this optimization pass.
+Research and implementation details: `OPTIMIZATION_NOTES.md`.
+
 ## Fusion compatibility fix — 24 October 2026
 
 The first real Fusion use completed backend inference at 1920x1080, but the

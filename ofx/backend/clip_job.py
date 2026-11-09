@@ -14,6 +14,7 @@ from pathlib import Path
 import struct
 import sys
 import time
+from atomic_io import atomic_json, atomic_text
 
 
 def frame_path(directory, frame):
@@ -35,28 +36,34 @@ def valid_frame(path):
         return False
 
 
-def atomic_json(path, value):
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(value), encoding="utf-8")
-    os.replace(temp, path)
-
-
 def drive(node, comp, directory, start, end, token=None, frame_timeout=3600):
     count = int(math.floor(end - start + .00001)) + 1
     if count < 1:
         raise ValueError("The clip has no frames")
     started = time.monotonic()
     completed = 0
+    last_update = float("-inf")
 
     def status(state, text):
-        atomic_json(directory / "progress.json", dict(state=state, text=text, done=completed,
-            total=count, elapsed=round(time.monotonic() - started, 2)))
-        temporary = directory / "status.tmp"
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, directory / "status.txt")
+        nonlocal last_update
+        now = time.monotonic()
+        if state == "running" and now - last_update < .25:
+            return
+        last_update = now
+        # Progress is advisory. A temporarily locked progress file or a failed
+        # UI refresh must not discard an otherwise successful frame render.
+        try:
+            atomic_json(directory / "progress.json", dict(state=state, text=text, done=completed,
+                total=count, elapsed=round(now - started, 2)))
+            atomic_text(directory / "status.txt", text)
+        except OSError:
+            logging.warning("Could not publish progress; cached frames remain valid", exc_info=True)
         # A non-evaluating text parameter: updating it cannot invalidate renders.
-        if token is None or node.GetInput("bakeToken") == token:
-            node.SetInput("processStatus", text)
+        try:
+            if token is None or node.GetInput("bakeToken") == token:
+                node.SetInput("processStatus", text)
+        except Exception:
+            logging.warning("Fusion status update failed; processing continues", exc_info=True)
 
     try:
         status("running", f"Processing 0 / {count} frames (0%)")

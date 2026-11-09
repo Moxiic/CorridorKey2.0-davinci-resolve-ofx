@@ -169,13 +169,20 @@ outside Resolve. The plugin itself returns float images to the host.
 
 ## Performance and limitations
 
+The November optimization pass reuses model weights in CPU RAM between bake
+blocks (with RAM headroom checks and a 30-second idle limit), avoids redundant
+source reads, and reduces progress-update overhead. See
+[OPTIMIZATION_NOTES.md](OPTIMIZATION_NOTES.md) for research, tradeoffs and benchmarks.
+
 This is an **offline inference integration**, not a real-time keyer. It avoids
 loading PyTorch into Resolve, supports canceling waits, reports backend failures
 as failed OFX renders, and keeps each instance's files separate. A named Windows
 mutex serializes worker inference across instances to avoid loading several
-copies of the model into GPU memory. CUDA models are released after each neural
-job so Resolve and other instances can use the memory; revisiting a different
-block reloads the model. The current cache retains one block per instance.
+copies of the model into GPU memory. GPU models are offloaded after each neural
+job so Resolve and other instances can use VRAM. During a clip bake the loaded
+weights can remain in CPU RAM for the next block; preview workers and RAM-limited
+systems unload them. The prediction cache retains one block per instance, while
+the explicit bake stores completed output frames for the whole clip.
 
 To detect upstream image changes reliably, every render reads and hashes the
 selected temporal range, even on prediction cache hits. Native SHA-256 hashes

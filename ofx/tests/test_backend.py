@@ -7,12 +7,14 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
 sys.path.insert(0, str(BACKEND))
 from core import cache_key, compose, read_rgba, to_linear, to_srgb
+from worker import Engine
 
 
 def request():
@@ -22,6 +24,26 @@ def request():
 
 
 class NumericalTests(unittest.TestCase):
+    def test_cached_default_output_does_not_read_source_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d)
+            for i in range(2):
+                np.full((2, 3, 4), [2, .2, -.1, .5], dtype="<f4").tofile(directory / f"source_{i:06d}.bin")
+            engine = Engine(BACKEND.parents[1], directory, mock=True)
+            r = request(); engine.process(r)
+            with patch.object(engine, "source_linear", side_effect=AssertionError("unneeded source read")):
+                engine.process(r)
+                r.update(output=1, refiner=0)
+                (engine.output_dir / "fg_000000.npy").unlink()
+                engine.process(r)
+
+    def test_idle_cpu_model_is_released(self):
+        engine = Engine(Path('.'), Path('.'), mock=True)
+        engine.model = object(); engine.model_snapshot = ('snapshot',)
+        engine.model_last_used = time.monotonic() - 31
+        engine.release_idle_model()
+        self.assertIsNone(engine.model)
+        self.assertIsNone(engine.model_snapshot)
     def test_hdr_and_negative_transfer_round_trip(self):
         v = np.array([-3, -.1, 0, .0031308, .18, 1, 32], np.float32)
         np.testing.assert_allclose(to_linear(to_srgb(v)), v, rtol=2e-6, atol=1e-7)
